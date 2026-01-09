@@ -3,7 +3,7 @@
 
 Este proyecto proporciona un conjunto de **funciones en PostgreSQL** diseñadas para **gestionar particiones por fecha de forma automática y controlada**.
 >
-> Permite crear y administrar particiones únicamente por **día, mes o año**, asegurando una estructura consistente y fácil de mantener.
+> Permite crear y administrar particiones únicamente por **día, mes o año** usando la extension de pg_cron, asegurando una estructura consistente y fácil de mantener.
 >
 > Las funciones se encargan de:
 >
