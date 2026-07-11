@@ -5,7 +5,7 @@
 
 The **Autonomous Partition Management Engine (`prttb`)** is a 100% native, cloud-agnostic framework built entirely in PL/pgSQL. Its purpose is to automate the lifecycle of time-based partitioned tables in PostgreSQL. It acts as a background orchestrator that reads your retention policies, automatically pre-creates future partitions (to ensure zero downtime), and drops expired partitions (to free up storage).
 
-It completely replaces the need for complex, C-based extensions like `pg_partman`.
+It completely replaces the need for complex, extensions like `pg_partman`.
 
 ## 🚀 Key Advantages
 
