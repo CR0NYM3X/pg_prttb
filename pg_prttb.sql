@@ -24,7 +24,7 @@ CREATE TABLE prttb.ctl_partition_policy (
 -- 3. Unified Partition Management Log 
 CREATE TABLE prttb.log_partition_management (
     id_log BIGSERIAL PRIMARY KEY,
-    action_type VARCHAR(20) NOT NULL, -- 'CREATE', 'DROP', 'ERROR'
+    action_type VARCHAR(20) NOT NULL, -- 'CREATE', 'DROP', 'ERROR', 'CHECK_OK'
     target_schema VARCHAR(100) NOT NULL,
     target_table VARCHAR(100) NOT NULL,
     partition_name VARCHAR(200),
@@ -50,11 +50,14 @@ AS $$
 DECLARE
     rec RECORD;
     v_part_name VARCHAR;
-    v_start_time TIMESTAMP; -- Upgraded to TIMESTAMP for HOURLY precision
+    v_start_time TIMESTAMP;
     v_end_time TIMESTAMP;
     v_dynamic_sql TEXT;
     v_loop_idx INT;
     v_drop_record RECORD;
+    
+    -- Telemetry counter for the Heartbeat logic
+    v_action_count INT := 0; 
 BEGIN
     IF p_verbose THEN RAISE NOTICE 'Starting Partition Maintenance Protocol...'; END IF;
 
@@ -75,7 +78,6 @@ BEGIN
                 v_part_name  := format('%s_%s', rec.target_table, to_char(v_start_time, 'YYYY_MM_DD'));
                 
             ELSIF rec.part_interval = 'HOURLY' THEN
-                -- HOURLY Strategy (New)
                 v_start_time := DATE_TRUNC('hour', CURRENT_TIMESTAMP + (v_loop_idx || ' hour')::INTERVAL);
                 v_end_time   := v_start_time + INTERVAL '1 hour';
                 v_part_name  := format('%s_%s', rec.target_table, to_char(v_start_time, 'YYYY_MM_DD_HH24'));
@@ -94,10 +96,14 @@ BEGIN
                     INSERT INTO prttb.log_partition_management (action_type, target_schema, target_table, partition_name, query_executed)
                     VALUES ('CREATE', rec.target_schema, rec.target_table, v_part_name, v_dynamic_sql);
                     
+                    -- Increment action counter
+                    v_action_count := v_action_count + 1;
+                    
                     IF p_verbose THEN RAISE NOTICE '[CREATED] Partition: prttb.%', v_part_name; END IF;
                 EXCEPTION WHEN OTHERS THEN
                     INSERT INTO prttb.log_partition_management (action_type, target_schema, target_table, partition_name, error_message)
                     VALUES ('ERROR', rec.target_schema, rec.target_table, v_part_name, SQLERRM);
+                    v_action_count := v_action_count + 1;
                 END;
             END IF;
         END LOOP;
@@ -111,7 +117,6 @@ BEGIN
             nrel.nspname AS child_schema,
             crel.relname AS child_table,
             p.part_interval,
-            -- Determine the timestamp from the partition name suffix via regex
             CASE 
                 WHEN p.part_interval = 'MONTHLY' THEN to_timestamp(substring(crel.relname FROM '(\d{4}_\d{2})$'), 'YYYY_MM')
                 WHEN p.part_interval = 'DAILY'   THEN to_timestamp(substring(crel.relname FROM '(\d{4}_\d{2}_\d{2})$'), 'YYYY_MM_DD')
@@ -125,7 +130,6 @@ BEGIN
         JOIN pg_namespace nrel ON crel.relnamespace = nrel.oid
         JOIN prttb.ctl_partition_policy p ON npar.nspname = p.target_schema AND cpar.relname = p.target_table
     LOOP
-        -- If partition timestamp is older than expiration timestamp, drop it
         IF v_drop_record.part_timestamp IS NOT NULL AND v_drop_record.part_timestamp < v_drop_record.expiration_timestamp THEN
             BEGIN
                 v_dynamic_sql := format('DROP TABLE %I.%I;', v_drop_record.child_schema, v_drop_record.child_table);
@@ -134,21 +138,31 @@ BEGIN
                 INSERT INTO prttb.log_partition_management (action_type, target_schema, target_table, partition_name, query_executed)
                 VALUES ('DROP', v_drop_record.parent_schema, v_drop_record.parent_table, v_drop_record.child_table, v_dynamic_sql);
                 
+                -- Increment action counter
+                v_action_count := v_action_count + 1;
+                
                 IF p_verbose THEN RAISE NOTICE '[DROPPED] Expired Partition: %.%', v_drop_record.child_schema, v_drop_record.child_table; END IF;
             EXCEPTION WHEN OTHERS THEN
                 INSERT INTO prttb.log_partition_management (action_type, target_schema, target_table, partition_name, error_message)
                 VALUES ('ERROR', v_drop_record.parent_schema, v_drop_record.parent_table, v_drop_record.child_table, SQLERRM);
+                v_action_count := v_action_count + 1;
             END;
         END IF;
     END LOOP;
+
+    -- [3] PHASE: HEARTBEAT LOGGING (If no actions were taken)
+    IF v_action_count = 0 THEN
+        INSERT INTO prttb.log_partition_management (action_type, target_schema, target_table, partition_name, query_executed)
+        VALUES ('CHECK_OK', 'SYSTEM', 'ALL_POLICIES', 'NO_PARTITIONS_AFFECTED', 'Routine maintenance verified all partitions are up to date.');
+        
+        IF p_verbose THEN RAISE NOTICE '[HEARTBEAT] No partitions required creation or purging. System is up to date.'; END IF;
+    END IF;
 
     IF p_verbose THEN RAISE NOTICE 'Partition Maintenance Protocol Completed.'; END IF;
 END;
 $$;
 
--- Perimeter Defense: Strictly revoke public execution
 REVOKE EXECUTE ON FUNCTION prttb.fn_maintenance_partitions(BOOLEAN) FROM public;
-
 
 
 
@@ -158,6 +172,9 @@ REVOKE EXECUTE ON FUNCTION prttb.fn_maintenance_partitions(BOOLEAN) FROM public;
 -- VALIDATION: Cross-references the pg_catalog to ensure the target table is 
 --             actually a native partitioned table before accepting the policy.
 -- SECURITY: Zero Trust constraints applied. Revoked from PUBLIC.
+-- ==============================================================================
+-- ==============================================================================
+-- FUNCTION: prttb.fn_register_partition_policy (PATCHED)
 -- ==============================================================================
 CREATE OR REPLACE FUNCTION prttb.fn_register_partition_policy(
     p_target_schema VARCHAR,
@@ -174,7 +191,7 @@ AS $$
 DECLARE
     v_is_partitioned BOOLEAN;
 BEGIN
-    -- [1] Structural Validation: Ensure the table exists and is natively partitioned
+    -- [1] Structural Validation
     SELECT EXISTS (
         SELECT 1 
         FROM pg_catalog.pg_class c
@@ -185,22 +202,14 @@ BEGIN
     ) INTO v_is_partitioned;
 
     IF NOT v_is_partitioned THEN
-        RAISE EXCEPTION 'VALIDATION FAILED: Table %.% does not exist or is not a natively partitioned master table.', p_target_schema, p_target_table;
+        RAISE EXCEPTION 'VALIDATION FAILED: Table %.% does not exist or is not natively partitioned.', p_target_schema, p_target_table;
     END IF;
 
-    -- [2] Upsert Logic: Insert new policy or update if it already exists
+    -- [2] Upsert Logic
     INSERT INTO prttb.ctl_partition_policy (
-        target_schema, 
-        target_table, 
-        part_interval, 
-        retention_period, 
-        pre_create_amount
+        target_schema, target_table, part_interval, retention_period, pre_create_amount
     ) VALUES (
-        p_target_schema, 
-        p_target_table, 
-        p_part_interval, 
-        p_retention_period, 
-        p_pre_create_amount
+        p_target_schema, p_target_table, p_part_interval, p_retention_period, p_pre_create_amount
     )
     ON CONFLICT (target_schema, target_table) DO UPDATE 
     SET 
@@ -209,12 +218,11 @@ BEGIN
         pre_create_amount = EXCLUDED.pre_create_amount,
         date_insert = clock_timestamp();
 
-    RETURN format('SUCCESS: Partition policy registered/updated for %.%', p_target_schema, p_target_table);
+    -- [FIX]: Swapped %.% for %I.%I to comply with PostgreSQL format() rules
+    RETURN format('SUCCESS: Partition policy registered/updated for %I.%I', p_target_schema, p_target_table);
 END;
 $$;
 
--- Perimeter Defense: Strictly revoke public execution
-REVOKE EXECUTE ON FUNCTION prttb.fn_register_partition_policy(VARCHAR, VARCHAR, prttb.partition_interval, INTERVAL, INT) FROM public;
 
 COMMIT;
 
