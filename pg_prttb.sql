@@ -1,3 +1,5 @@
+BEGIN;
+
 CREATE SCHEMA IF NOT EXISTS prttb;
 
 -- 1. ENUM for Partition Interval (Upgraded with HOURLY support)
@@ -213,6 +215,10 @@ $$;
 
 -- Perimeter Defense: Strictly revoke public execution
 REVOKE EXECUTE ON FUNCTION prttb.fn_register_partition_policy(VARCHAR, VARCHAR, prttb.partition_interval, INTERVAL, INT) FROM public;
+
+COMMIT;
+
+
 
 
 
